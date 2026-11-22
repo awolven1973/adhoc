@@ -1153,8 +1153,7 @@
    (aggregate :reader aggregate :initform nil :initarg :aggregate)
    (indices :reader component-indices :initform nil :initarg :indices)
    (inittest :initform nil)
-   (suppressed? :initform nil :accessor suppressed?)
-   (adhoc-scene-graph::retransform? :initform nil)))
+   (suppressed? :initform nil :accessor suppressed?)))
 
 (defclass adhoc-scene-graph::node-mixin (adhoc-mixin)
   ()
@@ -2001,6 +2000,12 @@
   (let ((basket (gethash indices (slot-value aggregate 'value))))
     (slot-makunbound basket 'value)))
 
+(defmethod unbind-aggregate-slot-2 ((aggregate table-aggregate) indices)
+  (let ((basket (gethash indices (slot-value aggregate 'value))))
+    (prog1 (when (slot-boundp basket 'value)
+	     (slot-value basket 'value))
+      (slot-makunbound basket 'value))))
+
 (defmethod unbind-aggregate-slot ((aggregate array-aggregate) indices)
   (handler-bind ((#+SBCL sb-int:invalid-array-index-error
 		  #+CCL error
@@ -2019,12 +2024,50 @@
 					       nil)))
 			     (apply #'aref array indices))))
       (when maybe-basket
-	(slot-makunbound maybe-basket 'value)))))  
+	(slot-makunbound maybe-basket 'value)))))
+
+(defmethod unbind-aggregate-slot-2 ((aggregate array-aggregate) indices)
+  (handler-bind ((#+SBCL sb-int:invalid-array-index-error
+		  #+CCL error
+		  #+ALLEGRO error
+		  #+ecl error
+		  #'(lambda (e)
+		      (declare (ignore e))
+		      nil)))
+    (let* ((array (slot-value aggregate 'value))
+	   (maybe-basket (handler-bind ((#+SBCL sb-int:invalid-array-index-error
+					   #+CCL error
+					   #+ALLEGRO error
+					   #+ecl error
+					   #'(lambda (e)
+					       (declare (ignore e))
+					       nil)))
+			     (apply #'aref array indices))))
+      (when maybe-basket
+	(prog1 (when (slot-boundp maybe-basket 'value)
+		 (slot-value maybe-basket 'value))
+	  (slot-makunbound maybe-basket 'value))))))
 
 
 (defmethod frob-this-slot (class object (slotd aggregate-component-definition-mixin))
   (let ((basket (slot-basket object slotd)))
+    (slot-makunbound basket 'value)
+    nil))
+
+(defmethod frob-this-slot-2 (class object (slotd aggregate-component-definition-mixin))
+  (let ((basket (slot-basket object slotd)))
+    (slot-makunbound basket 'value)
+    nil))
+
+(defmethod frob-this-slot (class object (slotd component-definition-mixin))
+  (let ((basket (slot-basket object slotd)))
     (slot-makunbound basket 'value)))
+
+(defmethod frob-this-slot-2 (class object (slotd component-definition-mixin))
+  (let ((basket (slot-basket object slotd)))
+    (prog1 (when (slot-boundp basket 'value)
+	     (slot-value basket 'value))
+      (slot-makunbound basket 'value))))
 
 (defmethod frob-this-slot (class object (slotd basic-attribute-definition-mixin))
   (let ((basket (slot-basket object slotd)))
@@ -2033,6 +2076,16 @@
     (unless (eq (basket-status basket) :set)
       (slot-makunbound basket 'value))))
 
+(defmethod frob-this-slot-2 (class object (slotd basic-attribute-definition-mixin))
+  (let ((basket (slot-basket object slotd)))
+    (unless (eq (basket-status basket) :set)
+      (prog1 (when (slot-boundp basket 'value)
+	       (let ((v (slot-value basket 'value)))
+		 (when (typep v 'adhoc-mixin)
+		   v)))
+	(slot-makunbound basket 'value)))))
+
+#+NOMORE
 (defmethod frob-this-slot :after (class object (slotd effective-global-matrix-attribute-definition))
   (setf (slot-value object 'adhoc-scene-graph::retransform?) t)
   (values))
@@ -2040,40 +2093,112 @@
 (defmethod frob-this-slot (class object (slotd eager-attribute-definition-mixin))
   (ensure-slot-value class object slotd))
 
+(defmethod frob-this-slot-2 (class object (slotd eager-attribute-definition-mixin))
+  (ensure-slot-value class object slotd)
+  nil)
+
 (defmethod frob-aggregate-member-slot ((slotd eager-attribute-definition-mixin) aggregate indices)
   (ensure-aggregate-member aggregate indices))
 
 (defmethod frob-aggregate-member-slot (slotd aggregate indices)
   (unbind-aggregate-slot aggregate indices))
-  
-(defun frob-dependents-1 (&key (redraw nil))
-  (let ((frobbed-objects (if redraw (list redraw) ())))
-    (loop for dependent in %recompute%
-	  do (destructuring-bind (object slotd indices) dependent
-	       ;; frobbing a slot either uncaches it or recomputes it
-	       ;; depending on whether it's lazy or eager
-	       (if indices
-		   ;; when indices are present, object is the aggregate
-		   ;; so as to avoid an extra slot-value call
-		   (let ((aggregate object))
-		     (frob-aggregate-member-slot slotd aggregate indices))
-		   
-		   (let ((class (class-of object)))
-		     (frob-this-slot class object slotd)
-		     (pushnew object frobbed-objects)))))
 
-    ;; I can't remember why I'm not using rm-redraw-node here...there was some reason.
-    (loop for object in frobbed-objects
-	  when redraw
-	    do (adhoc-scene-graph::rm-erase-node object))
-    (loop for object in frobbed-objects
-	  when (and redraw (not (suppressed? object)))
-	    do (adhoc-scene-graph::rm-draw-node object)
-	  when (and (not (suppressed? object))
-		    (typep object 'adhoc-scene-graph::node-mixin)
-		    (send object adhoc-scene-graph::retransform?))
-	    do (adhoc-scene-graph::rm-retransform-node object)
-	       (setf (slot-value object 'adhoc-scene-graph::retransform?) nil)))
+(defmethod frob-aggregate-member-slot-2 (slotd aggregate indices)
+  (unbind-aggregate-slot-2 aggregate indices))
+
+(defun ancestors-1 (adhoc-object &optional result)
+  (if (null adhoc-object)
+      (reverse result)
+      (ancestors-1 (slot-value adhoc-object 'superior) (cons adhoc-object result))))
+
+(defun ancestors (adhoc-object)
+  (ancestors-1 (slot-value adhoc-object 'superior)))
+
+(defun any? (predicate list)
+  (loop for item in list
+	when (funcall predicate item)
+	  do (return t)
+	finally (return nil)))
+      
+
+(defun frob-dependents-1 ()
+  (loop for dependent in %recompute%
+	do (destructuring-bind (object slotd indices) dependent
+	     (if indices
+		 ;; when indices are present, object is the aggregate
+		 ;; so as to avoid an extra slot-value call
+		 (let ((aggregate object))
+		   (frob-aggregate-member-slot slotd aggregate indices))
+		       
+		 (let ((class (class-of object)))
+		   (frob-this-slot class object slotd)))))
+  (values))
+
+(defun frob-dependents-2 (redraw)
+  (loop for dependent in %recompute%
+	with graphically-invalidated = (list redraw)
+	with graphically-dead = ()
+	with just-retransform = ()
+	do (destructuring-bind (object slotd indices) dependent
+	     (if indices
+		 ;; when indices are present, object is the aggregate
+		 ;; so as to avoid an extra slot-value call
+		 (let ((aggregate object))
+		   (let ((dead (frob-aggregate-member-slot-2 slotd aggregate indices)))
+		     (when dead
+		       (pushnew dead graphically-dead))))
+
+		 (if (and (typep slotd 'effective-global-matrix-attribute-definition)
+			  (typep object 'adhoc-scene-graph::node-mixin))
+			      
+		     (let ((class (class-of object)))				
+		       (pushnew object just-retransform)
+		       (frob-this-slot class object slotd))
+				
+		     (let ((class (class-of object)))
+		       (unless (some #'(lambda (obj)
+					 (member obj graphically-invalidated))
+				     (ancestors object))
+			 (pushnew object graphically-invalidated))
+		       (let ((dead (frob-this-slot-2 class object slotd)))
+			 (when dead
+			   (pushnew dead graphically-dead)))))))
+		    
+	finally (setq graphically-invalidated
+		      (remove-if (lambda (object)
+				   (some (lambda (ancestor)
+					   (member ancestor graphically-invalidated))
+					 (ancestors object)))
+				 graphically-invalidated))
+
+		(setq graphically-dead
+		      (remove-if (lambda (object)
+				   (some (lambda (ancestor)
+					   (member ancestor graphically-dead))
+					 (ancestors object)))
+				 graphically-dead))
+
+		(setq just-retransform
+		      (remove-if (lambda (object)
+				   (or (member object graphically-dead)
+				       (member object graphically-invalidated)
+				       (some (lambda (ancestor)
+					       (or (member ancestor graphically-dead)
+						   (member ancestor graphically-invalidated)))
+					     (ancestors object))))
+				 just-retransform))
+			 
+		(loop for object in graphically-dead
+		      do (adhoc-scene-graph::rm-erase-node-recursively object))
+			 
+		(loop for object in just-retransform
+		      unless (suppressed? object)
+			do (adhoc-scene-graph::rm-retransform-node object))
+			 
+		(loop for object in graphically-invalidated
+		      do (adhoc-scene-graph::rm-erase-node-recursively object)
+		      unless (suppressed? object)
+			do (adhoc-scene-graph::rm-draw-node-recursively object)))
   (values))
   
 
@@ -2108,8 +2233,9 @@
 
 (defun frob-dependents (basket &key (redraw nil))
   (let ((%recompute% (all-dependents basket)))
-    
-    (frob-dependents-1 :redraw redraw)))
+    (if redraw
+	(frob-dependents-2 redraw)
+	(frob-dependents-1))))
       
 
 (defmethod slot-missing ((class adhoc-class) (instance adhoc-mixin) slot-name (op (eql 'slot-value))
